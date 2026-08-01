@@ -31,22 +31,95 @@ import xml.etree.ElementTree as ET
 
 import pytak
 
-VERSION = "1.0.0"
+
+def _read_version(default="1.0.1"):
+    """Version from the packaged VERSION file, falling back to a literal.
+
+    The literal used to be the only source and drifted behind setup.cfg's
+    `version = file: src/gpstak/VERSION`, so the status surface would have
+    advertised a version the package had not shipped for two releases. The
+    fallback stays because the file is only present when installed as a
+    package; a missing VERSION must not stop the gateway from starting.
+    """
+    try:
+        with open(
+            os.path.join(os.path.dirname(__file__), "VERSION"), encoding="utf-8"
+        ) as handle:
+            return handle.read().strip() or default
+    except OSError:
+        return default
+
+
+VERSION = _read_version()
 logger = logging.getLogger("gpstak")
+
+
+class _NoStatus:
+    """Stand-in for pytak.StatusWriter on a pytak too old to have one.
+
+    AryaOS boxes are updated as packages, so this gateway can land on a host
+    whose pytak predates StatusWriter (added in 7.4.0) -- fleet boxes are on
+    7.3.13 today. Failing to import would take the gateway down over its
+    telemetry helper, which is exactly backwards: feeding position to ATAK is
+    the job, reporting on it is not.
+
+    Degrading here is safe because it is VISIBLE. With nothing writing
+    /run/gpstak/status.json, a management UI reports "no status from this
+    gateway" rather than rendering an empty feed as though the sky were empty.
+    """
+
+    def count(self, *args, **kwargs) -> None:
+        return None
+
+    def record(self, *args, **kwargs) -> None:
+        return None
+
+    def set(self, *args, **kwargs) -> None:
+        return None
+
+    def write(self, *args, **kwargs) -> bool:
+        return False
+
+
+# Resolved at import so a missing StatusWriter is a startup-time decision
+# rather than an AttributeError on the first fix.
+_StatusWriter = getattr(pytak, "StatusWriter", None)
+
+
+def make_status(app_name: str, version: str):
+    """Return a status writer, or a no-op if this pytak has none."""
+    if _StatusWriter is None:
+        return _NoStatus()
+    return _StatusWriter(app_name, version=version)
 
 
 def conf(key, default):
     return os.environ.get(key, default)
 
 
+# gpsd TPV `mode`: 0 unknown, 1 no fix, 2 two-dimensional, 3 three-dimensional.
+FIX_MODES = {0: "unknown", 1: "none", 2: "2D", 3: "3D"}
+
+
 class GpsdClient:
     """Minimal asyncio gpsd watcher: keeps the latest TPV and raw NMEA lines."""
 
-    def __init__(self, host, port, nmea_sink=None):
+    def __init__(self, host, port, nmea_sink=None, status=None):
         self.host = host
         self.port = int(port)
         self.nmea_sink = nmea_sink
         self.tpv = None
+        # SKY is a separate gpsd report from TPV, so satellite count and HDOP
+        # have to be caught here or they are simply not available anywhere: a
+        # TPV carries a position but says nothing about how well it was fixed,
+        # which is the first thing an operator asks about a GPS gateway.
+        self.sky = None
+        self.sats_used = None
+        self.sats_seen = None
+        self.hdop = None
+        # Defaults to a no-op so a GpsdClient built without a worker (tests,
+        # a REPL) does not have to care about status at all.
+        self.status = status if status is not None else _NoStatus()
 
     async def run(self):
         while True:
@@ -66,17 +139,60 @@ class GpsdClient:
                     if text.startswith("$"):
                         if self.nmea_sink and text[3:6] in ("GGA", "RMC"):
                             self.nmea_sink(text)
+                            self.status.count("nmea_out")
                         continue
                     try:
                         msg = json.loads(text)
                     except ValueError:
+                        # Not JSON and not NMEA: gpsd said something we cannot
+                        # read. Counted rather than logged -- a chatty gpsd
+                        # would otherwise flood the journal -- but counted, so
+                        # a persistent protocol mismatch is visible.
+                        self.status.count("unparseable")
                         continue
-                    if msg.get("class") == "TPV" and msg.get("mode", 0) >= 2:
-                        self.tpv = msg
+                    self._observe(msg)
             except (OSError, ConnectionError) as exc:
                 logger.warning("gpsd: %s — retrying in 5s", exc)
                 self.tpv = None
+                self.status.count("gpsd_disconnect")
+                self.status.set(gpsd_connected=False, fix="none")
+                self.status.write(force=True)
                 await asyncio.sleep(5)
+
+    def _observe(self, msg):
+        """Fold one gpsd JSON report into our view of the receiver."""
+        klass = msg.get("class")
+
+        if klass == "SKY":
+            self.sky = msg
+            sats = msg.get("satellites") or []
+            self.sats_seen = len(sats)
+            self.sats_used = sum(1 for s in sats if s.get("used"))
+            self.hdop = msg.get("hdop")
+            self.status.count("sky")
+            self.status.set(
+                sats_used=self.sats_used, sats_seen=self.sats_seen, hdop=self.hdop
+            )
+            return
+
+        if klass != "TPV":
+            return
+
+        # A TPV is the inbound "fix" for this gateway; everything else gpsd
+        # emits (VERSION, DEVICES, WATCH) is bookkeeping, not data.
+        self.status.count("rx")
+        mode = msg.get("mode", 0) or 0
+        self.status.set(fix=FIX_MODES.get(mode, str(mode)), gpsd_connected=True)
+
+        if mode < 2:
+            # gpsd is talking to us but the receiver has no lock. This is the
+            # single most common real fault -- antenna indoors, cold start --
+            # and it is NOT the same as gpsd being down, so it gets its own
+            # counter instead of being folded into silence.
+            self.status.count("no_fix")
+            return
+
+        self.tpv = msg
 
 
 class NmeaFanout:
@@ -133,6 +249,19 @@ class GpsWorker(pytak.QueueWorker):
         super().__init__(queue, config)
         self.gpsd = gpsd
 
+        # Runtime status for Cockpit. systemd gives us /run/gpstak via
+        # RuntimeDirectory=, so this lands where the plugin looks for it.
+        self.status = make_status("gpstak", VERSION)
+        # The gpsd client, not the worker, is where fixes actually arrive: the
+        # worker only ever sees the LATEST TPV, so counting here would report
+        # the emit rate and call it the receive rate. Share the one writer.
+        gpsd.status = self.status
+
+        # Seed the gauges HERE, not in run(). __init__ happens before either
+        # loop is scheduled; doing it in run() raced the gpsd reader and could
+        # stamp fix="none" over a lock that had already been reported.
+        self.status.set(fix="none", gpsd_connected=False)
+
     async def run(self):
         rate = float(conf("GPSTAK_RATE", "1.0"))
         uid = conf("GPSTAK_UID", "GPSTAK-" + socket.gethostname())
@@ -140,13 +269,69 @@ class GpsWorker(pytak.QueueWorker):
         cot_type = conf("GPSTAK_COT_TYPE", "a-f-G")
         stale = int(conf("GPSTAK_STALE", "10"))
         logger.info("emitting CoT every %ss as uid=%s source=%s", rate, uid, source_name)
+
+        # Write once before any fix arrives. A cold GNSS start takes minutes and
+        # an indoor antenna never locks at all; without this the UI would report
+        # "no status from this gateway" for that whole time, which is
+        # indistinguishable from a gateway that failed to start.
+        self.status.set(
+            uid=uid,
+            source=source_name,
+            rate_s=rate,
+            gpsd=f"{self.gpsd.host}:{self.gpsd.port}",
+        )
+        self.status.write(force=True)
+
+        last_beat = 0.0
         while True:
-            tpv = self.gpsd.tpv
-            if tpv:
-                event = cot_event(tpv, uid, cot_type, stale, source_name)
-                if event:
-                    await self.put_queue(event)
+            event = self.next_event(uid, cot_type, stale, source_name)
+            if event is not None:
+                await self.put_queue(event)
+
+            # The UI decides freshness from whether this file keeps changing,
+            # so a locked-but-idle receiver MUST keep writing; otherwise a
+            # perfectly healthy gateway parked on a rooftop reads as wedged.
+            now = asyncio.get_running_loop().time()
+            if now - last_beat >= 5:
+                last_beat = now
+                self.status.write(force=True)
+            else:
+                self.status.write()
+
             await asyncio.sleep(rate)
+
+    def next_event(self, uid, cot_type, stale, source_name):
+        """Turn the latest fix into CoT, updating status. None if there is none.
+
+        Split out of run() so the status bookkeeping can be exercised without
+        driving an infinite loop.
+        """
+        tpv = self.gpsd.tpv
+        if not tpv:
+            # No usable fix yet. Distinct from "gpsd is down" (counted in the
+            # client) and from "we emitted nothing because we are idle".
+            self.status.count("no_fix_to_emit")
+            return None
+
+        event = cot_event(tpv, uid, cot_type, stale, source_name)
+        if event is None:
+            # A TPV that passed the mode>=2 gate but carries no lat/lon. Rare,
+            # and a receiver quirk rather than a normal state, so it is counted
+            # separately from no_fix instead of looking like a quiet gateway.
+            self.status.count("no_position")
+            return None
+
+        self.status.count("emitted")
+        self.status.record(
+            fix=FIX_MODES.get(tpv.get("mode", 0) or 0, "unknown"),
+            sats=self.gpsd.sats_used,
+            hdop=self.gpsd.hdop,
+            lat=tpv.get("lat"),
+            lon=tpv.get("lon"),
+            alt=tpv.get("altHAE", tpv.get("alt")),
+            speed=tpv.get("speed"),
+        )
+        return event
 
 
 async def main():
