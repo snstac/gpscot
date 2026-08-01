@@ -13,6 +13,10 @@ Restart=on-failure
 RestartSec=5
 DynamicUser=yes
 SyslogIdentifier=gpstak
+# Creates /run/gpstak for pytak's StatusWriter. Without this the status
+# file has nowhere to go under DynamicUser= (/run is not writable), and
+# every write fails silently into the write_errors counter.
+RuntimeDirectory=gpstak
 
 [Install]
 WantedBy=multi-user.target
