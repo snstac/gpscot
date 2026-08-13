@@ -34,7 +34,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import pytak
 
 
-def _read_version(default="2.0.0"):
+def _read_version(default="2.0.1"):
     """Version from the packaged VERSION file, falling back to a literal.
 
     The literal used to be the only source and drifted behind setup.cfg's
@@ -391,6 +391,19 @@ class GpsWorker(pytak.QueueWorker):
         return event
 
 
+async def run_cot_client(config, gpsd):
+    """Build and run one CoT transport attempt.
+
+    A failed transport cannot be reused safely. Keeping construction inside
+    this callback lets PyTAK discard the failed queues and sockets before the
+    bounded reconnect supervisor tries again in the same process.
+    """
+    clitool = pytak.CLITool(config)
+    await clitool.setup()
+    clitool.add_tasks({GpsWorker(clitool.tx_queue, config, gpsd)})
+    await clitool.run()
+
+
 async def main():
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -423,10 +436,10 @@ async def main():
         nmea_sink=nmea.send if nmea else None,
     )
 
-    clitool = pytak.CLITool(config)
-    await clitool.setup()
-    clitool.add_tasks({GpsWorker(clitool.tx_queue, config, gpsd)})
-    await asyncio.gather(clitool.run(), gpsd.run())
+    await asyncio.gather(
+        pytak.supervise_with_reconnect(config, lambda: run_cot_client(config, gpsd)),
+        gpsd.run(),
+    )
 
 
 def cli_main():

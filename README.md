@@ -4,6 +4,10 @@ GPSCOT feeds a Linux device's gpsd position to TAK clients as network GPS.
 It emits Cursor on Target position events to `COT_URL` and can optionally
 fan out raw NMEA sentences for WinTAK.
 
+GPSCOT 2.0.1 and later rebuild the PyTAK client in-process with bounded
+backoff when the destination is unavailable or local network policy is being
+replaced. GNSS input remains live while the output transport reconnects.
+
 Typical AryaOS use:
 
 ```sh
