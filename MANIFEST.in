@@ -1,4 +1,4 @@
-include README.md LICENSE src/gpstak/VERSION
+include README.md LICENSE src/gpscot/VERSION
 graft src
 global-exclude __pycache__/*
 global-exclude *.py[cod]

@@ -1,5 +1,5 @@
 # Usage: VERSION=1.0.0 nfpm package -f nfpm.yaml -p deb -t out/
-name: gpstak
+name: gpscot
 arch: all
 platform: linux
 version: ${VERSION}
@@ -8,7 +8,7 @@ section: net
 priority: optional
 maintainer: "Sensors & Signals LLC <oss@snstac.com>"
 vendor: "Sensors & Signals LLC"
-homepage: https://github.com/snstac/gpstak
+homepage: https://github.com/snstac/gpscot
 license: Apache-2.0
 description: |
   Network GPS for TAK. Reads gpsd, emits Cursor on Target position events
@@ -16,27 +16,32 @@ description: |
 
 depends:
   - python3
-  - pytak
+  - pytak (>= 7.5.0)
   - gpsd
 recommends:
-  - cockpit-gpstak
+  - cockpit-gpscot
+replaces:
+  - gpstak
+  - python3-gpstak
+conflicts:
+  - gpstak
+  - python3-gpstak
 
 contents:
-  - src: ./gpstak/gpstak.py
-    dst: /usr/local/bin/gpstak
+  - src: ./gpscot/gpscot.py
+    dst: /usr/local/bin/gpscot
     file_info:
       mode: 0755
-  - src: ./packaging/default/gpstak
-    dst: /etc/default/gpstak
+  - src: ./packaging/default/gpscot
+    dst: /etc/default/gpscot
     type: config|noreplace
     file_info:
       mode: 0644
-  - src: ./packaging/systemd/gpstak.service
-    dst: /lib/systemd/system/gpstak.service
+  - src: ./packaging/systemd/gpscot.service
+    dst: /lib/systemd/system/gpscot.service
     file_info:
       mode: 0644
 
 scripts:
   postinstall: ./packaging/postinst.sh
   preremove: ./packaging/prerm.sh
-

@@ -1,23 +1,23 @@
-# GPSTAK
+# GPSCOT
 
-GPSTAK feeds a Linux device's gpsd position to TAK clients as network GPS.
+GPSCOT feeds a Linux device's gpsd position to TAK clients as network GPS.
 It emits Cursor on Target position events to `COT_URL` and can optionally
 fan out raw NMEA sentences for WinTAK.
 
 Typical AryaOS use:
 
 ```sh
-sudo apt install gpstak cockpit-gpstak
-sudo systemctl enable --now gpstak
+sudo apt install gpscot cockpit-gpscot
+sudo systemctl enable --now gpscot
 ```
 
-Configuration lives in `/etc/default/gpstak`:
+Configuration lives in `/etc/default/gpscot`:
 
 - `COT_URL`: PyTAK destination, default `udp+broadcast://255.255.255.255:4349`
 - `NMEA_TARGETS`: optional space-separated `host:port` targets for raw NMEA
-- `GPSTAK_RATE`: update interval in seconds
-- `GPSTAK_UID`: CoT UID, defaults to `GPSTAK-<hostname>`
-- `GPSTAK_SOURCE_NAME`: source name in CoT remarks, defaults to hostname
+- `GPSCOT_RATE`: update interval in seconds
+- `GPSCOT_UID`: CoT UID, defaults to `GPSCOT-<hostname>`
+- `GPSCOT_SOURCE_NAME`: source name in CoT remarks, defaults to hostname
 - `GPSD_HOST` / `GPSD_PORT`: gpsd endpoint
 
 Build packages:
@@ -28,9 +28,9 @@ make package
 
 The Debian package installs:
 
-- `/usr/bin/gpstak`
-- `/etc/default/gpstak`
-- `/lib/systemd/system/gpstak.service`
+- `/usr/bin/gpscot`
+- `/etc/default/gpscot`
+- `/lib/systemd/system/gpscot.service`
 
 ## License
 

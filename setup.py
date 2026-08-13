@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Setup for GPSTAK."""
+"""Setup for GPSCOT."""
 
 from setuptools import setup
 

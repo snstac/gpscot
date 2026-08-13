@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright Sensors & Signals LLC https://www.snstac.com/
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the GPSTAK runtime status surface.
+"""Tests for the GPSCOT runtime status surface.
 
 These drive the gpsd reader with real gpsd JSON reports rather than invented
 ones, because the whole difficulty here is that a GPS gateway has several
@@ -21,8 +21,7 @@ import pytest
 
 import pytak
 
-import gpstak.gpstak as gpstak
-
+import gpscot.gpscot as gpscot
 
 needs_statuswriter = pytest.mark.skipif(
     not hasattr(pytak, "StatusWriter"),
@@ -63,12 +62,12 @@ SKY = {
 
 
 def _client(tmp_path, status=None):
-    client = gpstak.GpsdClient("127.0.0.1", 2947)
+    client = gpscot.GpsdClient("127.0.0.1", 2947)
     client.status = status if status is not None else _writer(tmp_path)
     return client
 
 
-def _writer(tmp_path, name="gpstak-test"):
+def _writer(tmp_path, name="gpscot-test"):
     return pytak.StatusWriter(name, path=str(tmp_path / "status.json"))
 
 
@@ -77,7 +76,7 @@ def _worker(tmp_path, client):
 
     __init__ needs a live queue and config; none of the status behaviour does.
     """
-    worker = gpstak.GpsWorker.__new__(gpstak.GpsWorker)
+    worker = gpscot.GpsWorker.__new__(gpscot.GpsWorker)
     worker.gpsd = client
     worker.status = client.status
     return worker
@@ -101,12 +100,15 @@ class TestGpsdObservation:
         assert doc["counters"]["rx"] == 1
         assert doc["fix"] == "3D"
         assert doc["gpsd_connected"] is True
+        assert doc["health"]["state"] == "ok"
+        assert doc["input"]["connection"] == "connected"
+        assert doc["input"]["fix"] == "3D"
         assert client.tpv is TPV_3D
 
     def test_no_lock_is_counted_distinctly_and_does_not_become_a_position(
         self, tmp_path
     ):
-        """"gpsd up, receiver searching" must not read the same as "gpsd down"."""
+        """ "gpsd up, receiver searching" must not read the same as "gpsd down"."""
         client = _client(tmp_path)
         client._observe(TPV_NO_FIX)
         client.status.write(force=True)
@@ -115,6 +117,7 @@ class TestGpsdObservation:
         assert doc["counters"]["rx"] == 1
         assert doc["counters"]["no_fix"] == 1
         assert doc["fix"] == "none"
+        assert doc["health"]["state"] == "degraded"
         # The critical part: a no-fix TPV must never be adopted as a position.
         assert client.tpv is None
 
@@ -170,7 +173,7 @@ class TestUnreadableInputIsNotAFix:
             return _Reader(), _Writer()
 
         async def _drive():
-            client = gpstak.GpsdClient("127.0.0.1", 2947, status=status)
+            client = gpscot.GpsdClient("127.0.0.1", 2947, status=status)
             orig = asyncio.open_connection
             asyncio.open_connection = _fake_open
             try:
@@ -203,12 +206,13 @@ class TestEmittedEvents:
         client._observe(TPV_3D)
         worker = _worker(tmp_path, client)
 
-        event = worker.next_event("GPSTAK-t", "a-f-G", 10, "t")
+        event = worker.next_event("GPSCOT-t", "a-f-G", 10, "t")
         assert event is not None
         worker.status.write(force=True)
 
         doc = _doc(worker.status)
         assert doc["counters"]["emitted"] == 1
+        assert doc["output"]["state"] == "connected"
         entry = doc["recent"][0]
         assert entry["fix"] == "3D"
         assert entry["lat"] == 37.7601
@@ -221,7 +225,7 @@ class TestEmittedEvents:
         client = _client(tmp_path)
         worker = _worker(tmp_path, client)
 
-        assert worker.next_event("GPSTAK-t", "a-f-G", 10, "t") is None
+        assert worker.next_event("GPSCOT-t", "a-f-G", 10, "t") is None
         worker.status.write(force=True)
 
         doc = _doc(worker.status)
@@ -235,7 +239,7 @@ class TestEmittedEvents:
         client.tpv = {"class": "TPV", "mode": 3}  # mode says 3D, no position
         worker = _worker(tmp_path, client)
 
-        assert worker.next_event("GPSTAK-t", "a-f-G", 10, "t") is None
+        assert worker.next_event("GPSCOT-t", "a-f-G", 10, "t") is None
         worker.status.write(force=True)
 
         doc = _doc(worker.status)
@@ -251,10 +255,10 @@ class TestStatusDegradesVisibly:
     """
 
     def test_no_op_status_when_pytak_is_too_old(self, monkeypatch):
-        monkeypatch.setattr(gpstak, "_StatusWriter", None)
-        status = gpstak.make_status("gpstak", "1.0.1")
+        monkeypatch.setattr(gpscot, "_StatusWriter", None)
+        status = gpscot.make_status("gpscot", "1.0.0")
 
-        assert isinstance(status, gpstak._NoStatus)
+        assert isinstance(status, gpscot._NoStatus)
         # Every call the gateway makes must be safe on the stand-in.
         status.count("rx")
         status.record(lat=1.0, lon=2.0)
@@ -264,9 +268,9 @@ class TestStatusDegradesVisibly:
 
     def test_the_read_path_survives_a_no_op_status(self, monkeypatch, tmp_path):
         """The counters are wired into _observe; prove they are not load-bearing."""
-        monkeypatch.setattr(gpstak, "_StatusWriter", None)
-        client = gpstak.GpsdClient("127.0.0.1", 2947)
-        assert isinstance(client.status, gpstak._NoStatus)
+        monkeypatch.setattr(gpscot, "_StatusWriter", None)
+        client = gpscot.GpsdClient("127.0.0.1", 2947)
+        assert isinstance(client.status, gpscot._NoStatus)
 
         client._observe(SKY)
         client._observe(TPV_3D)
@@ -277,9 +281,9 @@ class TestStatusDegradesVisibly:
         assert client.sats_used == 2
 
     def test_real_writer_used_when_available(self):
-        if gpstak._StatusWriter is None:
+        if gpscot._StatusWriter is None:
             pytest.skip("installed pytak has no StatusWriter")
-        assert not isinstance(gpstak.make_status("gpstak", "1.0.1"), gpstak._NoStatus)
+        assert not isinstance(gpscot.make_status("gpscot", "1.0.0"), gpscot._NoStatus)
 
 
 class TestVersion:
@@ -287,6 +291,6 @@ class TestVersion:
         """The literal used to drift behind setup.cfg's VERSION file."""
         import os
 
-        path = os.path.join(os.path.dirname(gpstak.__file__), "VERSION")
+        path = os.path.join(os.path.dirname(gpscot.__file__), "VERSION")
         with open(path, encoding="utf-8") as handle:
-            assert gpstak.VERSION == handle.read().strip()
+            assert gpscot.VERSION == handle.read().strip()
