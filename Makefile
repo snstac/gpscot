@@ -1,4 +1,4 @@
-REPO_NAME ?= gpstak
+REPO_NAME ?= gpscot
 PY_SRC = src/$(REPO_NAME)
 SHELL := /bin/bash
 .DEFAULT_GOAL := editable

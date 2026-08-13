@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-GPSTAK: Network GPS for TAK — feed this device's GNSS position to ATAK/WinTAK.
+GPSCOT: Network GPS for TAK — feed this device's GNSS position to ATAK/WinTAK.
 
 ATAK's "External or Network GPS" listens on UDP 4349 for Cursor on Target XML
 and adopts the received point as the device's own position (WinTAK also accepts
-raw NMEA). GPSTAK reads gpsd and emits both:
+raw NMEA). GPSCOT reads gpsd and emits both:
 
   - CoT position events via PyTAK to COT_URL (default
     udp+broadcast://255.255.255.255:4349 — every ATAK device on the subnet),
   - optional raw NMEA ($GPGGA/$GPRMC passthrough from gpsd) to NMEA_TARGETS
     ("host:port host:port") for WinTAK.
 
-Configuration is PyTAK-style via /etc/default/gpstak (systemd EnvironmentFile)
-or the environment: COT_URL, GPSTAK_RATE, GPSTAK_UID, GPSTAK_COT_TYPE,
-GPSTAK_STALE, GPSD_HOST, GPSD_PORT, NMEA_TARGETS.
+Configuration is PyTAK-style via /etc/default/gpscot (systemd EnvironmentFile)
+or the environment: COT_URL, GPSCOT_RATE, GPSCOT_UID, GPSCOT_COT_TYPE,
+GPSCOT_STALE, GPSD_HOST, GPSD_PORT, NMEA_TARGETS.
 
 See https://ampledata.org/network_gps.html
 
@@ -27,16 +27,18 @@ import json
 import logging
 import os
 import socket
+import time
 import xml.etree.ElementTree as ET
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pytak
 
 
-def _read_version(default="1.0.1"):
+def _read_version(default="1.0.0"):
     """Version from the packaged VERSION file, falling back to a literal.
 
     The literal used to be the only source and drifted behind setup.cfg's
-    `version = file: src/gpstak/VERSION`, so the status surface would have
+    `version = file: src/gpscot/VERSION`, so the status surface would have
     advertised a version the package had not shipped for two releases. The
     fallback stays because the file is only present when installed as a
     package; a missing VERSION must not stop the gateway from starting.
@@ -51,7 +53,7 @@ def _read_version(default="1.0.1"):
 
 
 VERSION = _read_version()
-logger = logging.getLogger("gpstak")
+logger = logging.getLogger("gpscot")
 
 
 class _NoStatus:
@@ -64,7 +66,7 @@ class _NoStatus:
     the job, reporting on it is not.
 
     Degrading here is safe because it is VISIBLE. With nothing writing
-    /run/gpstak/status.json, a management UI reports "no status from this
+    /run/gpscot/status.json, a management UI reports "no status from this
     gateway" rather than rendering an empty feed as though the sky were empty.
     """
 
@@ -75,6 +77,15 @@ class _NoStatus:
         return None
 
     def set(self, *args, **kwargs) -> None:
+        return None
+
+    def set_health(self, *args, **kwargs) -> None:
+        return None
+
+    def set_input(self, *args, **kwargs) -> None:
+        return None
+
+    def set_output(self, *args, **kwargs) -> None:
         return None
 
     def write(self, *args, **kwargs) -> bool:
@@ -95,6 +106,27 @@ def make_status(app_name: str, version: str):
 
 def conf(key, default):
     return os.environ.get(key, default)
+
+
+def redact_cot_url(url):
+    """Return a status-safe destination without credentials or tokens."""
+    try:
+        parts = urlsplit(str(url))
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        query = urlencode(
+            [
+                (
+                    key,
+                    "REDACTED" if key.lower() in ("token", "password") else value,
+                )
+                for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            ]
+        )
+        return urlunsplit((parts.scheme, host, parts.path, query, parts.fragment))
+    except (TypeError, ValueError):
+        return "invalid://destination"
 
 
 # gpsd TPV `mode`: 0 unknown, 1 no fix, 2 two-dimensional, 3 three-dimensional.
@@ -131,6 +163,9 @@ class GpsdClient:
                 writer.write(("?WATCH=" + json.dumps(watch) + "\n").encode())
                 await writer.drain()
                 logger.info("connected to gpsd at %s:%s", self.host, self.port)
+                self.status.set_health("degraded", "gpsd connected; waiting for fix")
+                self.status.set(input_state="connected")
+                self.status.write(force=True)
                 while True:
                     line = await reader.readline()
                     if not line:
@@ -156,6 +191,8 @@ class GpsdClient:
                 self.tpv = None
                 self.status.count("gpsd_disconnect")
                 self.status.set(gpsd_connected=False, fix="none")
+                self.status.set_health("fault", "gpsd connection unavailable")
+                self.status.set_input(connection="disconnected")
                 self.status.write(force=True)
                 await asyncio.sleep(5)
 
@@ -183,6 +220,11 @@ class GpsdClient:
         self.status.count("rx")
         mode = msg.get("mode", 0) or 0
         self.status.set(fix=FIX_MODES.get(mode, str(mode)), gpsd_connected=True)
+        self.status.set_input(
+            last_observation=time.time(),
+            connection="connected",
+            fix=FIX_MODES.get(mode, str(mode)),
+        )
 
         if mode < 2:
             # gpsd is talking to us but the receiver has no lock. This is the
@@ -190,9 +232,11 @@ class GpsdClient:
             # and it is NOT the same as gpsd being down, so it gets its own
             # counter instead of being folded into silence.
             self.status.count("no_fix")
+            self.status.set_health("degraded", "GNSS receiver has no position fix")
             return
 
         self.tpv = msg
+        self.status.set_health("ok", "GNSS position fix active")
 
 
 class NmeaFanout:
@@ -249,9 +293,9 @@ class GpsWorker(pytak.QueueWorker):
         super().__init__(queue, config)
         self.gpsd = gpsd
 
-        # Runtime status for Cockpit. systemd gives us /run/gpstak via
+        # Runtime status for Cockpit. systemd gives us /run/gpscot via
         # RuntimeDirectory=, so this lands where the plugin looks for it.
-        self.status = make_status("gpstak", VERSION)
+        self.status = make_status("gpscot", VERSION)
         # The gpsd client, not the worker, is where fixes actually arrive: the
         # worker only ever sees the LATEST TPV, so counting here would report
         # the emit rate and call it the receive rate. Share the one writer.
@@ -261,14 +305,22 @@ class GpsWorker(pytak.QueueWorker):
         # loop is scheduled; doing it in run() raced the gpsd reader and could
         # stamp fix="none" over a lock that had already been reported.
         self.status.set(fix="none", gpsd_connected=False)
+        self.status.set_health("degraded", "waiting for gpsd")
+        self.status.set_input(connection="connecting")
+        self.status.set_output(
+            "connected",
+            destination=redact_cot_url(config.get("COT_URL", "")),
+        )
 
     async def run(self):
-        rate = float(conf("GPSTAK_RATE", "1.0"))
-        uid = conf("GPSTAK_UID", "GPSTAK-" + socket.gethostname())
-        source_name = conf("GPSTAK_SOURCE_NAME", socket.gethostname())
-        cot_type = conf("GPSTAK_COT_TYPE", "a-f-G")
-        stale = int(conf("GPSTAK_STALE", "10"))
-        logger.info("emitting CoT every %ss as uid=%s source=%s", rate, uid, source_name)
+        rate = float(conf("GPSCOT_RATE", "1.0"))
+        uid = conf("GPSCOT_UID", "GPSCOT-" + socket.gethostname())
+        source_name = conf("GPSCOT_SOURCE_NAME", socket.gethostname())
+        cot_type = conf("GPSCOT_COT_TYPE", "a-f-G")
+        stale = int(conf("GPSCOT_STALE", "10"))
+        logger.info(
+            "emitting CoT every %ss as uid=%s source=%s", rate, uid, source_name
+        )
 
         # Write once before any fix arrives. A cold GNSS start takes minutes and
         # an indoor antenna never locks at all; without this the UI would report
@@ -322,6 +374,11 @@ class GpsWorker(pytak.QueueWorker):
             return None
 
         self.status.count("emitted")
+        self.status.set_output(
+            "connected",
+            last_success=time.time(),
+            destination=redact_cot_url(getattr(self, "config", {}).get("COT_URL", "")),
+        )
         self.status.record(
             fix=FIX_MODES.get(tpv.get("mode", 0) or 0, "unknown"),
             sats=self.gpsd.sats_used,
@@ -337,14 +394,18 @@ class GpsWorker(pytak.QueueWorker):
 async def main():
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s gpstak %(levelname)s %(message)s",
+        format="%(asctime)s gpscot %(levelname)s %(message)s",
     )
     parser = configparser.ConfigParser()
-    parser.read_dict({"gpstak": {
-        "COT_URL": conf("COT_URL", "udp+broadcast://255.255.255.255:4349"),
-        "PYTAK_NO_HELLO": "1",
-    }})
-    config = parser["gpstak"]
+    parser.read_dict(
+        {
+            "gpscot": {
+                "COT_URL": conf("COT_URL", "udp+broadcast://255.255.255.255:4349"),
+                "PYTAK_NO_HELLO": "1",
+            }
+        }
+    )
+    config = parser["gpscot"]
     # Pass through PYTAK_* (TLS etc.) from the environment.
     for key, val in os.environ.items():
         if key.startswith("PYTAK_"):
@@ -356,8 +417,11 @@ async def main():
         nmea = NmeaFanout(targets)
         logger.info("NMEA passthrough to: %s", targets)
 
-    gpsd = GpsdClient(conf("GPSD_HOST", "127.0.0.1"), conf("GPSD_PORT", "2947"),
-                      nmea_sink=nmea.send if nmea else None)
+    gpsd = GpsdClient(
+        conf("GPSD_HOST", "127.0.0.1"),
+        conf("GPSD_PORT", "2947"),
+        nmea_sink=nmea.send if nmea else None,
+    )
 
     clitool = pytak.CLITool(config)
     await clitool.setup()
