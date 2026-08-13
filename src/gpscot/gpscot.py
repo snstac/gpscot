@@ -34,7 +34,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import pytak
 
 
-def _read_version(default="1.0.0"):
+def _read_version(default="2.0.0"):
     """Version from the packaged VERSION file, falling back to a literal.
 
     The literal used to be the only source and drifted behind setup.cfg's
